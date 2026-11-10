@@ -40,101 +40,104 @@ func (a *CoreNodeMetricsProvider) scrapePod(ip string, port string, path string,
 	}
 
 	var samples []*pb.MetricSample
-
 	for name, fam := range families {
-		wantBase := false
-		wantSum := false
-		wantCount := false
+		samples = append(samples, extractFamilySamples(name, fam, whitelist)...)
+	}
+	return samples, nil
+}
 
-		for _, w := range whitelist {
-			if w == name {
-				wantBase = true
-			}
-			if w == name+"_sum" {
-				wantSum = true
-			}
-			if w == name+"_count" {
-				wantCount = true
-			}
-			if w == name+"_bucket" {
-				wantBase = true
-			}
+// extractFamilySamples converts matching metrics in a Prometheus MetricFamily
+// into MetricSamples according to whitelist.
+func extractFamilySamples(name string, fam *dto.MetricFamily, whitelist []string) []*pb.MetricSample {
+	var wantBase, wantSum, wantCount bool
+	for _, w := range whitelist {
+		switch w {
+		case name, name + "_bucket":
+			wantBase = true
+		case name + "_sum":
+			wantSum = true
+		case name + "_count":
+			wantCount = true
+		}
+	}
+	if !wantBase && !wantSum && !wantCount {
+		return nil
+	}
+
+	var samples []*pb.MetricSample
+	for _, m := range fam.Metric {
+		labels := make(map[string]string, len(m.Label))
+		for _, pair := range m.Label {
+			labels[pair.GetName()] = pair.GetValue()
 		}
 
-		if !wantBase && !wantSum && !wantCount {
-			continue
-		}
-
-		for _, m := range fam.Metric {
-			labels := make(map[string]string)
-			for _, pair := range m.Label {
-				labels[pair.GetName()] = pair.GetValue()
+		switch fam.GetType() {
+		case dto.MetricType_GAUGE:
+			if m.Gauge != nil && wantBase {
+				samples = append(samples, pb.MetricSample_builder{
+					Name:   new(name),
+					Labels: labels,
+					Gauge:  new(m.Gauge.GetValue()),
+				}.Build())
 			}
-
-			switch fam.GetType() {
-			case dto.MetricType_GAUGE:
-				if m.Gauge != nil && wantBase {
-					samples = append(samples, pb.MetricSample_builder{
-						Name:   new(name),
-						Labels: labels,
-						Gauge:  new(m.Gauge.GetValue()),
-					}.Build())
-				}
-			case dto.MetricType_COUNTER:
-				if m.Counter != nil && wantBase {
-					samples = append(samples, pb.MetricSample_builder{
-						Name:    new(name),
-						Labels:  labels,
-						Counter: new(m.Counter.GetValue()),
-					}.Build())
-				}
-			case dto.MetricType_HISTOGRAM:
-				if m.Histogram != nil {
-					if wantBase {
-						buckets := make(map[string]uint64)
-						for _, b := range m.Histogram.Bucket {
-							le := fmt.Sprintf("%g", b.GetUpperBound())
-							buckets[le] = b.GetCumulativeCount()
-						}
-
-						sum := m.Histogram.GetSampleSum()
-						count := m.Histogram.GetSampleCount()
-
-						samples = append(samples, pb.MetricSample_builder{
-							Name:   new(name),
-							Labels: labels,
-							Histogram: pb.Histogram_builder{
-								Buckets: buckets,
-								Sum:     new(sum),
-								Count:   new(count),
-							}.Build(),
-						}.Build())
-					}
-
-					// The sum and the count of the observations of a
-					// histogram are cumulative, like counters: they only
-					// increase (the sum, as long as no observation is
-					// negative), except when the source resets them.
-					if wantSum {
-						samples = append(samples, pb.MetricSample_builder{
-							Name:    new(name + "_sum"),
-							Labels:  labels,
-							Counter: new(m.Histogram.GetSampleSum()),
-						}.Build())
-					}
-
-					if wantCount {
-						samples = append(samples, pb.MetricSample_builder{
-							Name:    new(name + "_count"),
-							Labels:  labels,
-							Counter: new(float64(m.Histogram.GetSampleCount())),
-						}.Build())
-					}
-				}
+		case dto.MetricType_COUNTER:
+			if m.Counter != nil && wantBase {
+				samples = append(samples, pb.MetricSample_builder{
+					Name:    new(name),
+					Labels:  labels,
+					Counter: new(m.Counter.GetValue()),
+				}.Build())
+			}
+		case dto.MetricType_HISTOGRAM:
+			if m.Histogram != nil {
+				samples = append(samples, extractHistogramSamples(name, labels, m.Histogram, wantBase, wantSum, wantCount)...)
 			}
 		}
 	}
-	return samples, nil
+	return samples
+}
+
+// extractHistogramSamples builds the requested histogram, _sum, and _count
+// samples for a single Prometheus histogram metric observation.
+func extractHistogramSamples(name string, labels map[string]string, hist *dto.Histogram, wantBase, wantSum, wantCount bool) []*pb.MetricSample {
+	var samples []*pb.MetricSample
+	if wantBase {
+		buckets := make(map[string]uint64, len(hist.Bucket))
+		for _, b := range hist.Bucket {
+			le := fmt.Sprintf("%g", b.GetUpperBound())
+			buckets[le] = b.GetCumulativeCount()
+		}
+
+		samples = append(samples, pb.MetricSample_builder{
+			Name:   new(name),
+			Labels: labels,
+			Histogram: pb.Histogram_builder{
+				Buckets: buckets,
+				Sum:     new(hist.GetSampleSum()),
+				Count:   new(hist.GetSampleCount()),
+			}.Build(),
+		}.Build())
+	}
+
+	// The sum and the count of the observations of a histogram are cumulative,
+	// like counters: they only increase (the sum, as long as no observation is
+	// negative), except when the source resets them.
+	if wantSum {
+		samples = append(samples, pb.MetricSample_builder{
+			Name:    new(name + "_sum"),
+			Labels:  labels,
+			Counter: new(hist.GetSampleSum()),
+		}.Build())
+	}
+
+	if wantCount {
+		samples = append(samples, pb.MetricSample_builder{
+			Name:    new(name + "_count"),
+			Labels:  labels,
+			Counter: new(float64(hist.GetSampleCount())),
+		}.Build())
+	}
+	return samples
 }
 
 func (a *CoreNodeMetricsProvider) processPrometheusMetric(pod corev1.Pod, m *pb.MetricDefinition, class *xasv1.MetricProviderClass) []*pb.MetricBatch {
